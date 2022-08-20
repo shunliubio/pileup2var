@@ -1,0 +1,917 @@
+#!/usr/bin/perl -w
+
+
+#    pileup2var is a variant calling tool for RNA-based next-generation sequencing data.
+#
+#    Copyright (C) 2022 Shun Liu
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+use strict;
+use Getopt::Long;
+use Pod::Usage;
+use File::Basename;
+use POSIX;
+use Parallel::ForkManager;
+
+my $version="1.1.0";
+my $thread=1;
+my $bam_file;
+my $genome_file;
+my $out_file;
+my $max_depth=0;
+my $mpq_cutoff=0;
+my $mbq_cutoff=0;
+my $coverage=1;
+my $target_base;
+my $ins_count=0;
+my $del_count=0;
+my $tagYfZf;# Only valid if the mapper is Hisat-3n and the Yf and Zf tag are used.
+my $failed_count=-1;# Only valid if the mapper is Hisat-3n and the Zf tag is used.
+my $flag=1804;
+my $strandness="R";#"F" for R1 forward, "R" for R1 reverse;
+my $phred64;
+my $region;
+my $bed_file;
+my $vn;
+my $help;
+my $man;
+
+GetOptions(
+	"thread|t=i"            => \$thread,
+	"bam|b=s"               => \$bam_file,
+	"genome|g=s"            => \$genome_file,
+	"out|o=s"               => \$out_file,
+	"mrd|m=i"               => \$max_depth,
+	"mpq|p=i"               => \$mpq_cutoff,
+	"mbq|q=i"               => \$mbq_cutoff,
+	"coverage|c=i"          => \$coverage,
+	"base|a=s"              => \$target_base,
+	"inscount|i=i"          => \$ins_count,
+	"delcount|d=i"          => \$del_count,
+	"tagYfZf|y!"            => \$tagYfZf,
+	"failedcount|n=i"       => \$failed_count,
+	"flag|f=i"              => \$flag,
+	"strandness|s=s"        => \$strandness,
+	"phred64|6!"            => \$phred64,
+	"region|r=s"            => \$region,
+	"bed|e=s"               => \$bed_file,
+	"version|v!"            => \$vn,
+	"help|h!"               => \$help,
+	"man!"                  => \$man
+) or pod2usage(2);
+pod2usage(-verbose => 0) if $help;
+pod2usage(-verbose => 2) if $man;
+pod2usage("Version: $version") if $vn;
+die "$bam_file was not found!:$!\n" unless -e $bam_file;
+die "$genome_file was not found!:$!\n" unless -e $genome_file;
+pod2usage("strandness must be F for secondstrand or R for firststrand") && pod2usage(1) unless ($strandness eq "F" || $strandness eq "R");
+if ($target_base) {
+	pod2usage("Target base must be A, T, C, G, a, t, c or g if defined") && pod2usage(1) unless ($target_base =~ /[ATCGatcg]/);
+}
+my $test_line;
+my @test_block;
+if ($tagYfZf) {
+	$test_line=`samtools mpileup -A -B -x -d 0 -q 0 -Q 0 --output-extra FLAG,QNAME,Zf,Yf -f $genome_file $bam_file 2> /dev/null \| head -1`;
+	chomp($test_line);
+	@test_block=split /\t/,$test_line;
+	if ($failed_count >= 0) {
+		die "Unable to detect the Yf and Zf tag! Note that -n and -y are only valid if the mapper is Hisat-3n and the Yf and Zf tag are used.:$!\n" if $test_block[8] =~ /\*/ && $test_block[9] =~ /\*/;
+	} else {
+		die "Unable to detect the Yf and Zf tag! Note that -y is only valid if the mapper is Hisat-3n and the Yf and Zf tag are used.:$!\n" if $test_block[8] =~ /\*/ && $test_block[9] =~ /\*/;
+	}
+} else {
+	if ($failed_count >= 0) {
+		$test_line=`samtools mpileup -A -B -x -d 0 -q 0 -Q 0 --output-extra FLAG,QNAME,Zf -f $genome_file $bam_file 2> /dev/null \| head -1`;
+		chomp($test_line);
+		@test_block=split /\t/,$test_line;
+		die "Unable to detect the Zf tag! Note that -n is only valid if the mapper is Hisat-3n and the Zf tag is used.:$!\n" if $test_block[8] =~ /\*/;
+	}
+}
+
+
+my @mpileupOptions;
+my $mpileupOptions="";
+if ($region) {
+	push @mpileupOptions,"-r $region";
+}
+if ($bed_file) {
+	if (-e $bed_file) {
+		push @mpileupOptions,"-l $bed_file";
+	} else {
+		die "$bed_file was not found!:$!\n"
+	}
+}
+$mpileupOptions=join " ",@mpileupOptions;
+
+my $phred64_enable;
+if ($phred64) {
+	$phred64_enable="-6";
+} else {
+	$phred64_enable="";
+}
+
+
+my %RC=(
+	"A" => "T",
+	"C" => "G",
+	"T" => "A",
+	"G" => "C",
+	"N" => "N",
+	"a" => "t",
+	"c" => "g",
+	"t" => "a",
+	"g" => "c",
+	"n" => "n",
+);
+
+if (! -e $bam_file.".bai") {
+	print STDERR "bam index not existed. Indexing...\n";
+	system("samtools index $bam_file");
+	print STDERR "Index completed!\n";
+}
+
+print STDERR "Using $thread thread(s)...\n";
+print STDERR "variant calling...\n";
+#disable multiple threads if $region or $bed_file is defined.
+if ($region || $bed_file || $thread==1) {
+	&pileupProcessing($max_depth,$mpq_cutoff,$mbq_cutoff,$flag,$mpileupOptions,$genome_file,$bam_file,"NA",$out_file,"NA",$coverage,$target_base,$ins_count,$del_count,$tagYfZf,$failed_count,$strandness,$phred64_enable);
+} elsif ($thread>1) {
+	my @chromName;
+	my @outTempFile;
+	my $outTempFile;
+	my $pm=Parallel::ForkManager->new($thread);
+	open BAM,"samtools view -H $bam_file \| cut -f 2 \| grep ^SN \|" or die "Can't open $bam_file:$!";
+	while (my $line=<BAM>) {
+		chomp($line);
+		my @block=split /:/,$line;
+		push @chromName,$block[1];
+	}
+	close BAM;
+	foreach my $chr (@chromName) {
+		my $outTempName=$chr;
+		push @outTempFile,"$out_file.$outTempName";
+		$pm->start and next;
+		warn "Processing $chr...\n";
+		&pileupProcessing($max_depth,$mpq_cutoff,$mbq_cutoff,$flag,"NA",$genome_file,$bam_file,$chr,$out_file,$outTempName,$coverage,$target_base,$ins_count,$del_count,$tagYfZf,$failed_count,$strandness,$phred64_enable);
+		warn "$chr: Done!\n";
+		$pm->finish;
+	}
+	$pm->wait_all_children;
+	open OUT,">$out_file" or die "Can't write to $out_file:$!";
+	if ($tagYfZf) {
+		if ($failed_count >=0) {
+			print OUT join "\t","Chrom","Position","Strand","Ref","Cov","A","T","C","G","Ins","Del","InsBase","DelBase","CountPass","unConverted","Converted"."\n";
+		} else {
+			print OUT join "\t","Chrom","Position","Strand","Ref","Cov","A","T","C","G","Ins","Del","InsBase","DelBase","unConverted","Converted"."\n";
+		}
+	} else {
+		if ($failed_count >=0) {
+			print OUT join "\t","Chrom","Position","Strand","Ref","Cov","A","T","C","G","Ins","Del","InsBase","DelBase","CountPass"."\n";
+		} else {
+			print OUT join "\t","Chrom","Position","Strand","Ref","Cov","A","T","C","G","Ins","Del","InsBase","DelBase"."\n";
+		}
+	}
+	close OUT;
+	$outTempFile=join " ",@outTempFile;
+	system("cat $outTempFile >> $out_file");
+	system("rm $outTempFile");
+} else {
+	die "thread should be an integer (>=1)!:$!\n"
+}
+
+print STDERR "All done!\n";
+
+
+######################################## sub defined ###################################
+
+
+sub pileupProcessing {
+	my $max_depth=shift;
+	my $mpq_cutoff=shift;
+	my $mbq_cutoff=shift;
+	my $flag=shift;
+	my $mpileupOptions=shift;
+	my $genome_file=shift;
+	my $bam_file=shift;
+	my $chr=shift;
+	my $out_file=shift;
+	my $outTempName=shift;
+	my $coverage=shift;
+	my $target_base=shift;
+	my $ins_count=shift;
+	my $del_count=shift;
+	my $tagYfZf=shift;
+	my $failed_count=shift;
+	my $strandness=shift;
+	my $phred64_enable=shift;
+	if ($chr eq "NA") {
+		open OUT,">$out_file" or die "Can't write to $out_file:$!";
+		if ($tagYfZf) {
+			open PILEUP,"samtools mpileup -A -B -x $phred64_enable -d $max_depth -q $mpq_cutoff -Q $mbq_cutoff --ff $flag --output-extra FLAG,QNAME,Zf,Yf $mpileupOptions -f $genome_file $bam_file \|" or die "Can't open $genome_file or $bam_file:$!";
+			if ($failed_count >= 0) {
+				print OUT join "\t","Chrom","Position","Strand","Ref","Cov","A","T","C","G","Ins","Del","InsBase","DelBase","CountPass","unConverted","Converted"."\n";
+			} else {
+				print OUT join "\t","Chrom","Position","Strand","Ref","Cov","A","T","C","G","Ins","Del","InsBase","DelBase","unConverted","Converted"."\n";
+			}
+		} else {
+			if ($failed_count >= 0) {
+				open PILEUP,"samtools mpileup -A -B -x $phred64_enable -d $max_depth -q $mpq_cutoff -Q $mbq_cutoff --ff $flag --output-extra FLAG,QNAME,Zf $mpileupOptions -f $genome_file $bam_file \|" or die "Can't open $genome_file or $bam_file:$!";
+				print OUT join "\t","Chrom","Position","Strand","Ref","Cov","A","T","C","G","Ins","Del","InsBase","DelBase","CountPass"."\n";
+			} else {
+				open PILEUP,"samtools mpileup -A -B -x $phred64_enable -d $max_depth -q $mpq_cutoff -Q $mbq_cutoff --ff $flag --output-extra FLAG,QNAME $mpileupOptions -f $genome_file $bam_file \|" or die "Can't open $genome_file or $bam_file:$!";
+				print OUT join "\t","Chrom","Position","Strand","Ref","Cov","A","T","C","G","Ins","Del","InsBase","DelBase"."\n";
+			}
+		}
+	} else {
+		if ($tagYfZf) {
+			open PILEUP,"samtools mpileup -A -B -x $phred64_enable -d $max_depth -q $mpq_cutoff -Q $mbq_cutoff --ff $flag --output-extra FLAG,QNAME,Zf,Yf -r $chr -f $genome_file $bam_file \|" or die "Can't open $genome_file or $bam_file:$!";
+		} else {
+			if ($failed_count >= 0) {
+				open PILEUP,"samtools mpileup -A -B -x $phred64_enable -d $max_depth -q $mpq_cutoff -Q $mbq_cutoff --ff $flag --output-extra FLAG,QNAME,Zf -r $chr -f $genome_file $bam_file \|" or die "Can't open $genome_file or $bam_file:$!";
+			} else {
+				open PILEUP,"samtools mpileup -A -B -x $phred64_enable -d $max_depth -q $mpq_cutoff -Q $mbq_cutoff --ff $flag --output-extra FLAG,QNAME -r $chr -f $genome_file $bam_file \|" or die "Can't open $genome_file or $bam_file:$!";
+			}
+		}
+		open OUT,">$out_file.$outTempName" or die "Can't write to $out_file.$outTempName:$!";
+	}
+	while (my $line=<PILEUP>) {
+		chomp($line);
+		my @block=split /\t/,$line;
+		next unless $block[3];# this case occurs when no reads meet the mbq_cutoff value in that position.
+		my $readIndex=0;
+		my $refBase=$block[2];
+		my @readBase=split //,$block[4];
+		my @readName=split /,/,$block[6];
+		my @readFlag=split /,/,$block[7];
+		my @tagZfCount;
+		my @tagYfCount;
+		if ($tagYfZf) {
+			@tagZfCount=split /,/,$block[8];
+			@tagYfCount=split /,/,$block[9];
+		} else {
+			@tagZfCount=split /,/,$block[8] if $failed_count >= 0;
+		}
+		my %baseNum=("+" => {"A"=>0,"T"=>0,"C"=>0,"G"=>0,"Ins"=>0,"Del"=>0}, "-" => {"A"=>0,"T"=>0,"C"=>0,"G"=>0,"Ins"=>0,"Del"=>0});
+		my %ReadPairOverlapDetection;
+		my $insertion;
+		my $deletion;
+		my $insertionRC;
+		my $deletionRC;
+		my $insertionAll;
+		my $deletionAll;
+		my @insertionAll;
+		my @deletionAll;
+		my $insertionRCAll;
+		my $deletionRCAll;
+		my @insertionRCAll;
+		my @deletionRCAll;
+		my $covPlus=0;
+		my $covMinus=0;
+		my $tagZfCountPassPlus=0;
+		my $tagZfCountPassMinus=0;
+		my $tagZfCountPlus=0;
+		my $tagZfCountMinus=0;
+		my $tagYfCountPlus=0;
+		my $tagYfCountMinus=0;
+		my $outLine;
+		for (my $i = 0; $i < @readBase; $i++) {
+			if ($readBase[$i] eq "^") {# read start
+				$i++;
+			} elsif ($readBase[$i] eq "\$") {# read end
+				next;
+			} elsif ($readBase[$i] eq ">" || $readBase[$i] eq "<" || $readBase[$i] eq "*" || $readBase[$i] eq "#") {
+				$readIndex++;
+			} elsif ($readBase[$i] eq ".") {# match in forward strand
+				if ($readFlag[$readIndex] & 0x1) {# paired end
+					if (!exists($ReadPairOverlapDetection{$readName[$readIndex]})) {
+						$ReadPairOverlapDetection{$readName[$readIndex]}++;
+						if ($readFlag[$readIndex] & 0x40) {# first in pair
+							if ($strandness eq "F") {
+								$tagZfCountPassPlus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountPlus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountPlus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"+"}{uc($refBase)}++;
+								$covPlus++;
+							} else {
+								$tagZfCountPassMinus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountMinus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountMinus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"-"}{uc($RC{$refBase})}++;
+								$covMinus++;
+							}
+						} elsif($readFlag[$readIndex] & 0x80) {# second in pair
+							if ($strandness eq "F") {
+								$tagZfCountPassMinus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountMinus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountMinus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"-"}{uc($RC{$refBase})}++;
+								$covMinus++;
+							} else {
+								$tagZfCountPassPlus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountPlus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountPlus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"+"}{uc($refBase)}++;
+								$covPlus++;
+							}
+						} else {
+							warn "Unkown read pair flag: $readFlag[$readIndex]:$!\n";
+						}
+					}
+				} else {# single end
+					if ($strandness eq "F") {
+						$tagZfCountPassPlus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+						$tagZfCountPlus+=$tagZfCount[$readIndex] if $tagYfZf;
+						$tagYfCountPlus+=$tagYfCount[$readIndex] if $tagYfZf;
+						$baseNum{"+"}{uc($refBase)}++;
+						$covPlus++;
+					} else {
+						$tagZfCountPassMinus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+						$tagZfCountMinus+=$tagZfCount[$readIndex] if $tagYfZf;
+						$tagYfCountMinus+=$tagYfCount[$readIndex] if $tagYfZf;
+						$baseNum{"-"}{uc($RC{$refBase})}++;
+						$covMinus++;
+					}
+				}
+				$readIndex++;
+			} elsif ($readBase[$i] eq ",") {# match in reverse strand
+				if ($readFlag[$readIndex] & 0x1) {# paired end
+					if (!exists($ReadPairOverlapDetection{$readName[$readIndex]})) {
+						$ReadPairOverlapDetection{$readName[$readIndex]}++;
+						if ($readFlag[$readIndex] & 0x40) {# first in pair
+							if ($strandness eq "F") {
+								$tagZfCountPassMinus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountMinus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountMinus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"-"}{uc($RC{$refBase})}++;
+								$covMinus++;
+							} else {
+								$tagZfCountPassPlus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountPlus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountPlus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"+"}{uc($refBase)}++;
+								$covPlus++;
+							}
+						} elsif($readFlag[$readIndex] & 0x80) {# second in pair
+							if ($strandness eq "F") {
+								$tagZfCountPassPlus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountPlus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountPlus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"+"}{uc($refBase)}++;
+								$covPlus++;
+							} else {
+								$tagZfCountPassMinus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountMinus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountMinus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"-"}{uc($RC{$refBase})}++;
+								$covMinus++;
+							}
+						} else {
+							warn "Unkown read pair flag: $readFlag[$readIndex]:$!\n";
+						}
+					}
+				} else {# single end
+					if ($strandness eq "F") {
+						$tagZfCountPassMinus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+						$tagZfCountMinus+=$tagZfCount[$readIndex] if $tagYfZf;
+						$tagYfCountMinus+=$tagYfCount[$readIndex] if $tagYfZf;
+						$baseNum{"-"}{uc($RC{$refBase})}++;
+						$covMinus++;
+					} else {
+						$tagZfCountPassPlus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+						$tagZfCountPlus+=$tagZfCount[$readIndex] if $tagYfZf;
+						$tagYfCountPlus+=$tagYfCount[$readIndex] if $tagYfZf;
+						$baseNum{"+"}{uc($refBase)}++;
+						$covPlus++;
+					}
+				}
+				$readIndex++;
+			} elsif ($readBase[$i] =~ /[ATCGN]/) {# mismatch in forward strand
+				if ($readFlag[$readIndex] & 0x1) {# paired end
+					if (!exists($ReadPairOverlapDetection{$readName[$readIndex]})) {
+						$ReadPairOverlapDetection{$readName[$readIndex]}++;
+						if ($readFlag[$readIndex] & 0x40) {# first in pair
+							if ($strandness eq "F") {
+								$tagZfCountPassPlus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountPlus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountPlus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"+"}{$readBase[$i]}++;
+								$covPlus++;
+							} else {
+								$tagZfCountPassMinus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountMinus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountMinus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"-"}{$RC{$readBase[$i]}}++;
+								$covMinus++;
+							}
+						} elsif($readFlag[$readIndex] & 0x80) {# second in pair
+							if ($strandness eq "F") {
+								$tagZfCountPassMinus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountMinus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountMinus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"-"}{$RC{$readBase[$i]}}++;
+								$covMinus++;
+							} else {
+								$tagZfCountPassPlus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountPlus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountPlus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"+"}{$readBase[$i]}++;
+								$covPlus++;
+							}
+						} else {
+							warn "Unkown read pair flag: $readFlag[$readIndex]:$!\n";
+						}
+					}
+				} else {# single end
+					if ($strandness eq "F") {
+						$tagZfCountPassPlus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+						$tagZfCountPlus+=$tagZfCount[$readIndex] if $tagYfZf;
+						$tagYfCountPlus+=$tagYfCount[$readIndex] if $tagYfZf;
+						$baseNum{"+"}{$readBase[$i]}++;
+						$covPlus++;
+					} else {
+						$tagZfCountPassMinus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+						$tagZfCountMinus+=$tagZfCount[$readIndex] if $tagYfZf;
+						$tagYfCountMinus+=$tagYfCount[$readIndex] if $tagYfZf;
+						$baseNum{"-"}{$RC{$readBase[$i]}}++;
+						$covMinus++;
+					}
+				}
+				$readIndex++;
+			} elsif ($readBase[$i] =~ /[atcgn]/) {# mismatch in reverse strand
+				if ($readFlag[$readIndex] & 0x1) {# paired end
+					if (!exists($ReadPairOverlapDetection{$readName[$readIndex]})) {
+						$ReadPairOverlapDetection{$readName[$readIndex]}++;
+						if ($readFlag[$readIndex] & 0x40) {# first in pair
+							if ($strandness eq "F") {
+								$tagZfCountPassMinus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountMinus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountMinus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"-"}{$RC{uc($readBase[$i])}}++;
+								$covMinus++;
+							} else {
+								$tagZfCountPassPlus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountPlus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountPlus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"+"}{uc($readBase[$i])}++;
+								$covPlus++;
+							}
+						} elsif($readFlag[$readIndex] & 0x80) {# second in pair
+							if ($strandness eq "F") {
+								$tagZfCountPassPlus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountPlus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountPlus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"+"}{uc($readBase[$i])}++;
+								$covPlus++;
+							} else {
+								$tagZfCountPassMinus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+								$tagZfCountMinus+=$tagZfCount[$readIndex] if $tagYfZf;
+								$tagYfCountMinus+=$tagYfCount[$readIndex] if $tagYfZf;
+								$baseNum{"-"}{$RC{uc($readBase[$i])}}++;
+								$covMinus++;
+							}
+						} else {
+							warn "Unkown read pair flag: $readFlag[$readIndex]:$!\n";
+						}
+					}
+				} else {# single end
+					if ($strandness eq "F") {
+						$tagZfCountPassMinus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+						$tagZfCountMinus+=$tagZfCount[$readIndex] if $tagYfZf;
+						$tagYfCountMinus+=$tagYfCount[$readIndex] if $tagYfZf;
+						$baseNum{"-"}{$RC{uc($readBase[$i])}}++;
+						$covMinus++;
+					} else {
+						$tagZfCountPassPlus++ if $failed_count >= 0 && $tagZfCount[$readIndex] <= $failed_count;
+						$tagZfCountPlus+=$tagZfCount[$readIndex] if $tagYfZf;
+						$tagYfCountPlus+=$tagYfCount[$readIndex] if $tagYfZf;
+						$baseNum{"+"}{uc($readBase[$i])}++;
+						$covPlus++;
+					}
+				}
+				$readIndex++;
+			} elsif ($readBase[$i] eq "+") {# insertion
+				my @insertion;
+				my $insertionNum=0;
+				$i++;
+				if ($readBase[$i] =~ /[1-9]/) {
+					if ($readBase[$i+1] =~ /[0-9]/) {
+						die "Not supported in more than 99 insertions: $block[4]:$!" if $readBase[$i+2] =~ /[0-9]/;
+						$insertionNum=$readBase[$i].$readBase[$i+1];
+						$i++;
+					} else {
+						$insertionNum=$readBase[$i];
+					}
+					for (my $j = 0; $j < $insertionNum; $j++) {
+						$i++;
+						push @insertion,$readBase[$i];
+					}
+					$insertion=join "",@insertion;
+					$insertionRC=reverse $insertion;
+					$insertionRC=~tr/ATCGatcg/TAGCtagc/;
+					if ($insertion =~ /[ATCGN]+/) {
+						if ($readFlag[$readIndex-1] & 0x1) {# paired end
+							if (!exists($ReadPairOverlapDetection{$readName[$readIndex-1]})) {
+								$ReadPairOverlapDetection{$readName[$readIndex-1]}++;
+								if ($readFlag[$readIndex-1] & 0x40) {# first in pair
+									if ($strandness eq "F") {
+										$baseNum{"+"}{"Ins"}++;
+										push @insertionAll,$insertion;
+									} else {
+										$baseNum{"-"}{"Ins"}++;
+										push @insertionRCAll,$insertionRC;
+									}
+								} elsif($readFlag[$readIndex-1] & 0x80) {# second in pair
+									if ($strandness eq "F") {
+										$baseNum{"-"}{"Ins"}++;
+										push @insertionRCAll,$insertionRC;
+									} else {
+										$baseNum{"+"}{"Ins"}++;
+										push @insertionAll,$insertion;
+									}
+								} else {
+									warn "Unkown read pair flag: $readFlag[$readIndex-1]:$!\n";
+								}
+							}
+						} else {# single end
+							if ($strandness eq "F") {
+								$baseNum{"+"}{"Ins"}++;
+								push @insertionAll,$insertion;
+							} else {
+								$baseNum{"-"}{"Ins"}++;
+								push @insertionRCAll,$insertionRC;
+							}
+						}
+					} elsif ($insertion =~ /[atcgn]+/) {
+						if ($readFlag[$readIndex-1] & 0x1) {# paired end
+							if (!exists($ReadPairOverlapDetection{$readName[$readIndex-1]})) {
+								$ReadPairOverlapDetection{$readName[$readIndex-1]}++;
+								if ($readFlag[$readIndex-1] & 0x40) {# first in pair
+									if ($strandness eq "F") {
+										$baseNum{"-"}{"Ins"}++;
+										push @insertionRCAll,$insertionRC;
+									} else {
+										$baseNum{"+"}{"Ins"}++;
+										push @insertionAll,$insertion;
+									}
+								} elsif($readFlag[$readIndex-1] & 0x80) {# second in pair
+									if ($strandness eq "F") {
+										$baseNum{"+"}{"Ins"}++;
+										push @insertionAll,$insertion;
+									} else {
+										$baseNum{"-"}{"Ins"}++;
+										push @insertionRCAll,$insertionRC;
+									}
+								} else {
+									warn "Unkown read pair flag: $readFlag[$readIndex-1]:$!\n";
+								}
+							}
+						} else {# single end
+							if ($strandness eq "F") {
+								$baseNum{"-"}{"Ins"}++;
+								push @insertionRCAll,$insertionRC;
+							} else {
+								$baseNum{"+"}{"Ins"}++;
+								push @insertionAll,$insertion;
+							}
+						}
+					} else {
+						warn "Unkown insertion: $readFlag[$readIndex-1]:$!\n";
+					}
+				} else {
+					die "Error when parsing insertion: $block[4]:$!";
+				}
+			} elsif ($readBase[$i] eq "-") {# deletion
+				my @deletion;
+				my $deletionNum=0;
+				$i++;
+				if ($readBase[$i] =~ /[1-9]/) {
+					if ($readBase[$i+1] =~ /[0-9]/) {
+						die "Not supported in more than 99 deletions: $block[4]:$!" if $readBase[$i+2] =~ /[0-9]/;
+						$deletionNum=$readBase[$i].$readBase[$i+1];
+						$i++;
+					} else {
+						$deletionNum=$readBase[$i];
+					}
+					for (my $j = 0; $j < $deletionNum; $j++) {
+						$i++;
+						push @deletion,$readBase[$i];
+					}
+					$deletion=join "",@deletion;
+					$deletionRC=reverse $deletion;
+					$deletionRC=~tr/ATCGatcg/TAGCtagc/;
+					if ($deletion =~ /[ATCGN]+/) {
+						if ($readFlag[$readIndex-1] & 0x1) {# paired end
+							if (!exists($ReadPairOverlapDetection{$readName[$readIndex-1]})) {
+								$ReadPairOverlapDetection{$readName[$readIndex-1]}++;
+								if ($readFlag[$readIndex-1] & 0x40) {# first in pair
+									if ($strandness eq "F") {
+										$baseNum{"+"}{"Del"}++;
+										push @deletionAll,$deletion;
+									} else {
+										$baseNum{"-"}{"Del"}++;
+										push @deletionRCAll,$deletionRC;
+									}
+								} elsif($readFlag[$readIndex-1] & 0x80) {# second in pair
+									if ($strandness eq "F") {
+										$baseNum{"-"}{"Del"}++;
+										push @deletionRCAll,$deletionRC;
+									} else {
+										$baseNum{"+"}{"Del"}++;
+										push @deletionAll,$deletion;
+									}
+								} else {
+									warn "Unkown read pair flag: $readFlag[$readIndex-1]:$!\n";
+								}
+							}
+						} else {# single end
+							if ($strandness eq "F") {
+								$baseNum{"+"}{"Del"}++;
+								push @deletionAll,$deletion;
+							} else {
+								$baseNum{"-"}{"Del"}++;
+								push @deletionRCAll,$deletionRC;
+							}
+						}
+					} elsif ($deletion =~ /[atcgn]+/) {
+						if ($readFlag[$readIndex-1] & 0x1) {# paired end
+							if (!exists($ReadPairOverlapDetection{$readName[$readIndex-1]})) {
+								$ReadPairOverlapDetection{$readName[$readIndex-1]}++;
+								if ($readFlag[$readIndex-1] & 0x40) {# first in pair
+									if ($strandness eq "F") {
+										$baseNum{"-"}{"Del"}++;
+										push @deletionRCAll,$deletionRC;
+									} else {
+										$baseNum{"+"}{"Del"}++;
+										push @deletionAll,$deletion;
+									}
+								} elsif($readFlag[$readIndex-1] & 0x80) {# second in pair
+									if ($strandness eq "F") {
+										$baseNum{"+"}{"Del"}++;
+										push @deletionAll,$deletion;
+									} else {
+										$baseNum{"-"}{"Del"}++;
+										push @deletionRCAll,$deletionRC;
+									}
+								} else {
+									warn "Unkown read pair flag: $readFlag[$readIndex-1]:$!\n";
+								}
+							}
+						} else {# single end
+							if ($strandness eq "F") {
+								$baseNum{"-"}{"Del"}++;
+								push @deletionRCAll,$deletionRC;
+							} else {
+								$baseNum{"+"}{"Del"}++;
+								push @deletionAll,$deletion;
+							}
+						}
+					} else {
+						warn "Unkown deletion: $readFlag[$readIndex-1]:$!\n";
+					}
+				} else {
+					die "Error when parsing deletion: $block[4]:$!";
+				}
+			} else {
+				warn "Unkown read base: $readBase[$i]:$!\n";
+			}
+		}
+		if (@insertionAll) {
+			$insertionAll=join ",",@insertionAll;
+		} else {
+			$insertionAll="NA";
+		}
+		if (@insertionRCAll) {
+			$insertionRCAll=join ",",@insertionRCAll;
+		} else {
+			$insertionRCAll="NA";
+		}
+		if (@deletionAll) {
+			$deletionAll=join ",",@deletionAll;
+		} else {
+			$deletionAll="NA";
+		}
+		if (@deletionRCAll) {
+			$deletionRCAll=join ",",@deletionRCAll;
+		} else {
+			$deletionRCAll="NA";
+		}
+		if ($target_base) {
+			if (uc($refBase) eq $target_base && $covPlus>=$coverage && $baseNum{"+"}{"Ins"}>=$ins_count && $baseNum{"+"}{"Del"}>=$del_count) {
+				$outLine=join "\t",$block[0],$block[1],"+",$refBase,$covPlus,$baseNum{"+"}{"A"},$baseNum{"+"}{"T"},$baseNum{"+"}{"C"},$baseNum{"+"}{"G"},$baseNum{"+"}{"Ins"},$baseNum{"+"}{"Del"},$insertionAll,$deletionAll;
+				if ($tagYfZf) {
+					if ($failed_count >= 0) {
+						print OUT join "\t",$outLine,$tagZfCountPassPlus,$tagZfCountPlus,$tagYfCountPlus."\n";
+					} else {
+						print OUT join "\t",$outLine,$tagZfCountPlus,$tagYfCountPlus."\n";
+					}
+				} else {
+					if ($failed_count >= 0) {
+						print OUT join "\t",$outLine,$tagZfCountPassPlus."\n";
+					} else {
+						print OUT $outLine."\n";
+					}
+				}
+			}
+			if (uc($RC{$refBase}) eq $target_base && $covMinus>=$coverage && $baseNum{"-"}{"Ins"}>=$ins_count && $baseNum{"-"}{"Del"}>=$del_count) {
+				$outLine=join "\t",$block[0],$block[1],"-",$RC{$refBase},$covMinus,$baseNum{"-"}{"A"},$baseNum{"-"}{"T"},$baseNum{"-"}{"C"},$baseNum{"-"}{"G"},$baseNum{"-"}{"Ins"},$baseNum{"-"}{"Del"},$insertionRCAll,$deletionRCAll;
+				if ($tagYfZf) {
+					if ($failed_count >= 0) {
+						print OUT join "\t",$outLine,$tagZfCountPassMinus,$tagZfCountMinus,$tagYfCountMinus."\n";
+					} else {
+						print OUT join "\t",$outLine,$tagZfCountMinus,$tagYfCountMinus."\n";
+					}
+				} else {
+					if ($failed_count >= 0) {
+						print OUT join "\t",$outLine,$tagZfCountPassMinus."\n";
+					} else {
+						print OUT $outLine."\n";
+					}
+				}
+			}
+		} else {
+			if ($covPlus>=$coverage && $baseNum{"+"}{"Ins"}>=$ins_count && $baseNum{"+"}{"Del"}>=$del_count) {
+				$outLine=join "\t",$block[0],$block[1],"+",$refBase,$covPlus,$baseNum{"+"}{"A"},$baseNum{"+"}{"T"},$baseNum{"+"}{"C"},$baseNum{"+"}{"G"},$baseNum{"+"}{"Ins"},$baseNum{"+"}{"Del"},$insertionAll,$deletionAll;
+				if ($tagYfZf) {
+					if ($failed_count >= 0) {
+						print OUT join "\t",$outLine,$tagZfCountPassPlus,$tagZfCountPlus,$tagYfCountPlus."\n";
+					} else {
+						print OUT join "\t",$outLine,$tagZfCountPlus,$tagYfCountPlus."\n";
+					}
+				} else {
+					if ($failed_count >= 0) {
+						print OUT join "\t",$outLine,$tagZfCountPassPlus."\n";
+					} else {
+						print OUT $outLine."\n";
+					}
+				}
+			}
+			if ($covMinus>=$coverage && $baseNum{"-"}{"Ins"}>=$ins_count && $baseNum{"-"}{"Del"}>=$del_count) {
+				$outLine=join "\t",$block[0],$block[1],"-",$RC{$refBase},$covMinus,$baseNum{"-"}{"A"},$baseNum{"-"}{"T"},$baseNum{"-"}{"C"},$baseNum{"-"}{"G"},$baseNum{"-"}{"Ins"},$baseNum{"-"}{"Del"},$insertionRCAll,$deletionRCAll;
+				if ($tagYfZf) {
+					if ($failed_count >= 0) {
+						print OUT join "\t",$outLine,$tagZfCountPassMinus,$tagZfCountMinus,$tagYfCountMinus."\n";
+					} else {
+						print OUT join "\t",$outLine,$tagZfCountMinus,$tagYfCountMinus."\n";
+					}
+				} else {
+					if ($failed_count >= 0) {
+						print OUT join "\t",$outLine,$tagZfCountPassMinus."\n";
+					} else {
+						print OUT $outLine."\n";
+					}
+				}
+			}
+		}
+	}
+	close PILEUP;
+	close OUT;
+}
+
+__END__
+
+
+=head1 NAME
+
+pileup2var - Variant calling from RNA based sequencing data. 
+
+=head1 SYNOPSIS
+
+$ pileup2var [option] -g <genome.fa> -b <in.bam> -o <out.txt>
+
+
+ Options:
+   -v/--version              Print the version number.
+   -h/--help                 Print brief help messages.
+   --man                     Full documentation.
+   -b/--bam <file>           A bam format file of reads mapping. (Requried)
+   -g/--genome <file>        A fasta format file of genome sequences. (Required)
+   -o/--out <file>           A TSV file to output variant counts. (Required)
+   -t/--thread <int>         Number of CPU threads to run pileup2var. (Default: 1)
+   -m/--mrd <int>            Read maximally <int> reads at a position. Set 0 to remove the limit. (Default: 0)
+   -p/--mpq <int>            Minimum read mapping quality to be considered valid. (Default: 0)
+   -q/--mbq <int>            Minimum base quality for a valid read base. See the document for details. (Default: 0)
+   -c/--coverage <int>       Minimum read coverage to output a position record. (Default: 1)
+   -a/--base [ATCGatcg]      If defined, only output positions of the defined reference base. (Default: off)
+   -i/--inscount <int>       Minimum insertion count to output a position record. (Default: 0)
+   -d/--delcount <int>       Minimum deletion count to output a position record. (Default: 0)
+   -n/--failedcount <int>    Output counts <= <int> unconverted base counts at a position. (Default: -1)
+   -y/--tagYfZf              Output unconverted and converted counts at a position. (Default: off)
+   -f/--flag <int>           Ignore reads with the defined SAM flag value. (Default: 1804)
+   -s/--strandness [FR]      Either F for forward or R for reverse stranded library type. (Default: R)
+   -6/--phred64              Required if the base quality encoding is the Illumina 1.3+. (Default: off)
+   -r/--region <string>      If defined, only output positions in the <string> region. (Default: off)
+   -e/--bed <file>           If defined, only output positions in the regions from <file>. (Default: off)
+
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-v/--version>
+
+Print the version number.
+
+=item B<-h/--help>
+
+Print brief help messages and exit.
+
+=item B<--man>
+
+Print the manual page.
+
+=item B<-b/--bam <file>> 
+
+A sorted bam file generated from Bowtie, Bowtie2, Hisat2, STAR, Hisat-3n or other mapping tools.
+
+=item B<-o/--out <file>> 
+
+The default output is a tab-separetd and 13-column plain file.
+If `-n/failedcount` or (and) `-y/tagYfZf` is used, extra columns are added after `DelBase` (See `-n` and `-y` for details).
+
+=item B<-t/--thread <int>> 
+
+If `<int>` is larger than one, pileup2var will process data using multiple threads,
+which is highly recommended when the read depth is high and variant calling is performed in multiple chromosomes.
+
+=item B<-m/--mrd <int>> 
+
+The option is the same to `-d` in `samtools mpileup`. pipeup2var reads maximally `<int>` reads at a position
+even if the number of reads at the position are more than the value. Note that setting `-m 0` removes the read depth limit (Default).
+
+=item B<-p/--mpq <int>> 
+
+The option is the same to `-q` in `samtools mpileup`. pileup2var ignores reads with mapping quality scores less than `<int>`.
+
+=item B<-q/--mbq <int>> 
+
+pileup2var ignores reads with base quality scores less than `<int>`. Unlike `-Q` in `samtools mpileup`,
+pileup2var enforces read-pair overlap detection even if `-q 0` is set. This behaviour is different from GATK.
+
+=item B<-c/--coverage <int>> 
+
+pileup2var ignores positions with read coverage less than `<int>`.
+
+=item B<-a/--base [ATCGatcg]> 
+
+By default, pileup2var writes all positions covered by reads.
+This option makes pileup2var output positions of the user-defined base (case insensitive).
+
+=item B<-i/--inscount <int>> 
+
+pileup2var ignores positions with counts of reads containing insertion less than `<int>`. Setting `-i 0` disables insertion detection.
+
+=item B<-d/--delcount <int>> 
+
+pileup2var ignores positions with counts of reads containing deletion less than `<int>`. Setting `-d 0` disables deletion detection.
+
+=item B<-n/--failedcount <int>> 
+
+This option only can be used when the input bam file are generated by Hisat-3n.
+If defined, an extra column after `DelBase` is added to record counts of reads with unconverted base counts no larger than `<int>`.
+Setting `-n -1` disables the output.
+
+=item B<-y/--tagYfZf> 
+
+This option only can be used when the input bam file are generated by Hisat-3n.
+If defined, two extra columns after `DelBase` are added to record unconverted and converted base counts at a position, respectively.
+
+=item B<-f/--flag <int>> 
+
+The option is the same to `--ff` in `samtools mpileup`.
+pileup2var skips reads with the SAM flag value set (see https://broadinstitute.github.io/picard/explain-flags.html for decoding SAM flags).
+
+=item B<-s/--strandness [FR]> 
+
+The possible value in the option is either `F` or `R`.
+`F` means the library type is forward stranded, i.e., the first read of the read pair (or the only read in single-end) is from the transcript strand.
+`R` means the library type is reverse stranded, i.e., the first read of the read pair (or the only read in single-end) is from the opposite strand of the transcript.
+
+=item B<-6/--phred64> 
+
+The option is the same to `-6` in `samtools mpileup`.
+If defined, pileup2var treats the Phred quality score encoding in fastq files as 1.3+ or Phred+64.
+
+=item B<-r/--region <string>> 
+
+With the option defined, pileup2var only writes positions in the region of `<string>`. The possible format is `chr`, `chr:start` or `chr:start-end`.
+Note that the option is disabled if multiple threads are used.
+
+=item B<-e/--bed <file>> 
+
+The option is the same to `-l` in `samtools mpileup`. With the option defined, pileup2var only writes positions in the regions from `<file>`.
+Note that the option is disabled if multiple threads are used.
+
+=back
